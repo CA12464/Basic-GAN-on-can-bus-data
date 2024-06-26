@@ -1,0 +1,241 @@
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import accuracy_score, f1_score 
+from sklearn.model_selection import train_test_split
+
+# Set seeds for random number generators to ensure reproducibility
+seed = 42
+np.random.seed(seed)
+torch.manual_seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(seed)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load the data from CSV file
+csv_file = "./Data_Abeni1.csv"  # Replace with your actual CSV file path
+data_df = pd.read_csv(csv_file, index_col=False)
+
+# Initialize MinMaxScaler
+scaler = MinMaxScaler()
+
+# Fit the scaler on training data only
+train_data, test_data = train_test_split(data_df, test_size=0.2, random_state=seed)
+train_data_scaled = scaler.fit_transform(train_data)
+test_data_scaled = scaler.transform(test_data)
+
+# Convert data to PyTorch tensors and create DataLoader
+train_tensor = torch.tensor(train_data_scaled, dtype=torch.float32)
+train_dataset = TensorDataset(train_tensor)
+train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
+
+# Get the number of features in the dataset
+input_dim = train_data_scaled.shape[1]
+
+# Define the Generator model
+class Generator(nn.Module):
+    def __init__(self, latent_dim, output_dim):
+        super(Generator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(latent_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, output_dim),
+            nn.Sigmoid()  # Sigmoid to constrain output to [0, 1]
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+# Define the Discriminator model
+class Discriminator(nn.Module):
+    def __init__(self, input_dim):
+        super(Discriminator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.LeakyReLU(0.2),
+            nn.Linear(256, 128),
+            nn.LeakyReLU(0.2),
+            nn.Linear(128, 1) # doesnt have activation function on final layer, may be normal
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+# Wasserstein loss function
+def wasserstein_loss(y_true, y_pred):
+    return torch.mean(y_true * y_pred)
+
+# Hyperparameters and Configurations
+lr_generator = 0.0006
+lr_discriminator = 0.0005808
+latent_dim = 25
+epochs = 10
+beta1 = 0.5
+clip_value = 0.02
+patience = 10  # Increased patience
+
+# Initialize the generator and discriminator
+generator = Generator(latent_dim, input_dim).to(device)
+discriminator = Discriminator(input_dim).to(device)
+
+# Optimizers
+optimizer_G = optim.Adam(generator.parameters(), lr=lr_generator, betas=(beta1, 0.999)) # experiment with leaving betas as default
+optimizer_D = optim.Adam(discriminator.parameters(), lr=lr_discriminator, betas=(beta1, 0.999))
+
+# Early stopping parameters
+best_loss = float('inf')
+epochs_no_improve = 0
+
+# Training loop with Wasserstein loss and early stopping
+for epoch in range(epochs):
+    for batch in train_loader:
+        real_data = batch[0].to(device)
+
+        # Train Discriminator
+        noise = torch.randn(real_data.size(0), latent_dim, device=device)
+        fake_data = generator(noise).detach()
+
+        optimizer_D.zero_grad()
+
+        # Critic outputs for real and fake data
+        critic_real = discriminator(real_data)
+        critic_fake = discriminator(fake_data)
+
+        # Compute Wasserstein loss
+        d_loss = torch.mean(critic_fake) - torch.mean(critic_real)
+
+        # Update discriminator
+        d_loss.backward()
+        optimizer_D.step()
+
+        # Clip discriminator weights (if using WGAN or WGAN-GP)
+        for param in discriminator.parameters():
+            param.data.clamp_(-clip_value, clip_value)
+
+        # Train Generator
+        optimizer_G.zero_grad()
+
+        noise = torch.randn(real_data.size(0), latent_dim, device=device)
+        fake_data = generator(noise)
+
+        # Compute critic output on generated data
+        critic_fake = discriminator(fake_data)
+
+        # Generator loss (negative of critic's output)
+        g_loss = -torch.mean(critic_fake)
+
+        # Update generator
+        g_loss.backward()
+        optimizer_G.step()
+
+    # Check for early stopping
+    avg_loss = (g_loss + d_loss) / 2
+    if avg_loss < best_loss:
+        best_loss = avg_loss
+        epochs_no_improve = 0
+    else:
+        epochs_no_improve += 1
+
+    if epochs_no_improve >= patience:
+        print(f"Early stopping at epoch {epoch}")
+        break
+
+    if epoch % 10 == 0:
+        print(f"Epoch {epoch}/{epochs}, Discriminator Loss: {d_loss.item()}, Generator Loss: {g_loss.item()}")
+
+print("Training finished.")
+
+# Generate new data
+noise = torch.FloatTensor(np.random.normal(0, 1, (128, latent_dim))).to(device)
+generated_data = generator(noise).detach().cpu().numpy()
+
+# Scale generated data using the fitted scaler on training data
+generated_data_scaled = scaler.transform(generated_data)
+
+# Evaluate
+real_samples = test_data_scaled[:128]
+fake_samples = generated_data_scaled[:128]
+
+# Convert to PyTorch tensors
+real_samples_tensor = torch.FloatTensor(real_samples).to(device)
+fake_samples_tensor = torch.FloatTensor(fake_samples).to(device)
+
+# Evaluate the discriminator on real and fake samples
+real_score = discriminator(real_samples_tensor).detach().cpu().numpy()
+fake_score = discriminator(fake_samples_tensor).detach().cpu().numpy()
+
+#print("Real samples mean score:", real_score.mean())
+#print("Fake samples mean score:", fake_score.mean())
+
+# Convert scores to predictions
+real_predictions = (real_score > 0).astype(int)
+fake_predictions = (fake_score > 0).astype(int)
+
+# Calculate accuracy for real and fake data
+real_accuracy = accuracy_score(np.ones_like(real_predictions), real_predictions)
+fake_accuracy = accuracy_score(np.zeros_like(fake_predictions), fake_predictions)
+
+print(f"Discriminator accuracy on real data: {real_accuracy * 100:.2f}%")
+print(f"Discriminator accuracy on fake data: {fake_accuracy * 100:.2f}%")
+
+# Calculate F1 score for real data
+real_f1 = f1_score(np.ones_like(real_predictions), real_predictions, zero_division=1)
+
+# Calculate F1 score for fake data
+fake_f1 = f1_score(np.zeros_like(fake_predictions), fake_predictions, zero_division=1)
+
+# print(f"F1 Score on real data: {real_f1:.4f}")
+print(f"F1 Score on fake data: {fake_f1:.4f}")
+
+# Combine real and fake predictions with their respective labels
+all_predictions = np.concatenate([real_predictions, fake_predictions])
+all_labels = np.concatenate([np.ones_like(real_predictions), np.zeros_like(fake_predictions)])
+
+# Calculate F1 scores with different averages
+# f1_per_class = f1_score(all_labels, all_predictions, average=None, zero_division=1)
+f1_weighted = f1_score(all_labels, all_predictions, average='weighted', zero_division=1)
+
+# print("F1 score per class:", f1_per_class)
+print("Weighted-average F1 score:", f1_weighted)
+
+ 
+'''# Plot the confusion matrix
+plt.figure(figsize=(8, 6))
+sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', xticklabels=['Fake', 'Real'], yticklabels=['Fake', 'Real'])
+plt.xlabel('Predicted Labels')
+plt.ylabel('True Labels')
+plt.title('Confusion Matrix')
+plt.show()'''
+
+
+
+'''
+# Save models
+torch.save(generator.state_dict(), 'generator.pth')
+torch.save(discriminator.state_dict(), 'discriminator.pth')
+
+# Load models
+generator.load_state_dict(torch.load('generator.pth'))
+discriminator.load_state_dict(torch.load('discriminator.pth'))
+
+'''
+
+'''
+plt.figure(figsize=(10, 5))
+# Visualize some samples
+if real_samples.size > 0 and fake_samples.size > 0:
+    plt.plot(real_samples, label='Real')
+    plt.plot(fake_samples, label='Fake')
+    plt.title('Comparison of Real and Fake Samples')
+    plt.legend()
+    plt.show()
+else:
+    print("No samples to plot. Check the data and model outputs.")
+'''
