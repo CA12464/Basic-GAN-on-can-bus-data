@@ -74,7 +74,7 @@ def wasserstein_loss(y_true, y_pred):
 
 # Hyperparameters and Configurations
 lr_generator = 0.0006
-lr_discriminator = 0.0005808
+lr_discriminator = 0.000580552
 latent_dim = 25
 epochs = 10
 beta1 = 0.5
